@@ -2,100 +2,122 @@ name: AMFI NAV Daily Update
 
 on:
     schedule:
-      - cron: '25 3 * * *'    # 8:55am IST (3:25am UTC)
-      - cron: '25 17 * * *'   # 10:55pm IST (5:25pm UTC)
+      - cron: '25 3 * * *'    # 8:55am IST
+      - cron: '25 17 * * *'   # 10:55pm IST
     workflow_dispatch:
+
+env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
     update-nav:
       runs-on: ubuntu-latest
-
       permissions:
         contents: write
 
       steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
-
-        - name: Set up Python
-          uses: actions/setup-python@v5
+        - uses: actions/checkout@v4
+        - uses: actions/setup-python@v5
           with:
             python-version: '3.11'
 
-        - name: Install dependencies
-          run: pip install pandas openpyxl requests
+        - run: pip install pandas openpyxl requests
 
         - name: Download and process NAV data
           run: |
             python << 'EOF'
             import json, os, sys, requests
             from datetime import datetime, timezone
+            from io import StringIO
             import pandas as pd
 
             url = "https://www.amfiindia.com/api/latest-nav?type=&mfid=81"
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
 
-            # --- Inspect raw response ---
-            print(f"Content-Type : {resp.headers.get('Content-Type', 'unknown')}")
-            print(f"Response preview: {resp.text[:300]}")
-
-            # --- Parse: handle text, JSON string, nested dict, or list ---
             raw = resp.text.strip()
+            print(f"Content-Type : {resp.headers.get('Content-Type', 'unknown')}")
+            print(f"Raw preview  : {raw[:400]}")
 
+            # ── Parse response into a list of dicts ──────────────────────────
+            df = None
+
+            # 1. Try JSON
             try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                # Might be semicolon/pipe delimited text (AMFI text format)
-                from io import StringIO
-                df = pd.read_csv(StringIO(raw), sep=';', skipinitialspace=True)
-                print(f"Parsed as delimited text. Shape: {df.shape}")
-                data = None
+                parsed = json.loads(raw)
 
-            if data is not None:
-                # Unwrap double-encoded string
-                if isinstance(data, str):
-                    data = json.loads(data)
+                # Unwrap double-encoded string: "\"[{...}]\""
+                if isinstance(parsed, str):
+                    parsed = json.loads(parsed)
 
-                # Unwrap nested dict — find the list inside
-                if isinstance(data, dict):
-                    print(f"Response is a dict with keys: {list(data.keys())}")
-                    for key in ['data', 'Data', 'result', 'Result', 'nav', 'NAV', 'schemes']:
-                        if key in data and isinstance(data[key], list):
-                            data = data[key]
+                # Unwrap list-of-one-string: ["[{...}]"]
+                if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], str):
+                    parsed = json.loads(parsed[0])
+
+                # Unwrap nested dict: {"data": [...]}
+                if isinstance(parsed, dict):
+                    print(f"Dict keys: {list(parsed.keys())}")
+                    for k, v in parsed.items():
+                        if isinstance(v, list) and len(v) > 0:
+                            parsed = v
+                            print(f"Using key '{k}'")
                             break
-                    else:
-                        for v in data.values():
-                            if isinstance(v, list) and len(v) > 0:
-                                data = v
-                                break
 
-                if not isinstance(data, list) or len(data) == 0:
-                    print(f"ERROR: Unexpected data structure: {type(data)}")
-                    sys.exit(1)
+                if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+                    df = pd.DataFrame(parsed)
+                    print("Parsed as JSON array of objects")
 
-                df = pd.DataFrame(data)
+            except (json.JSONDecodeError, ValueError):
+                print("Not JSON — trying delimited text")
 
-            print(f"Columns: {list(df.columns)}")
-            print(f"Rows: {len(df)}")
-            print(df.head(2).to_string())
+            # 2. Fallback: delimited text (AMFI text format uses semicolons)
+            if df is None:
+                for sep in [';', '|', ',', '\t']:
+                    try:
+                        test = pd.read_csv(StringIO(raw), sep=sep, skipinitialspace=True)
+                        if len(test.columns) > 2:
+                            df = test
+                            print(f"Parsed as delimited text with sep='{sep}'")
+                            break
+                    except Exception:
+                        continue
+
+            if df is None or df.empty:
+                print(f"ERROR: Could not parse response. Full raw:\n{raw}")
+                sys.exit(1)
+
+            # Clean column names
+            df.columns = [str(c).strip() for c in df.columns]
+            print(f"\nColumns : {list(df.columns)}")
+            print(f"Rows    : {len(df)}")
+            print(f"\nSample row:\n{df.iloc[0].to_dict()}")
 
             df['Downloaded_At_UTC'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
+            # ── Write to Excel ───────────────────────────────────────────────
             excel_path = 'nav_history/nav_mfid81.xlsx'
             os.makedirs('nav_history', exist_ok=True)
 
             if os.path.exists(excel_path):
                 existing = pd.read_excel(excel_path, engine='openpyxl')
-                combined = pd.concat([existing, df], ignore_index=True)
-                combined.to_excel(excel_path, index=False, engine='openpyxl')
-                print(f"Appended {len(df)} rows. Total rows: {len(combined)}")
+                existing.columns = [str(c).strip() for c in existing.columns]
+                # Only append if columns match; otherwise recreate
+                if set(df.columns) == set(existing.columns):
+                    combined = pd.concat([existing, df], ignore_index=True)
+                    combined.to_excel(excel_path, index=False, engine='openpyxl')
+                    print(f"\nAppended {len(df)} rows. Total: {len(combined)}")
+                else:
+                    print(f"\nColumn mismatch — recreating file")
+                    print(f"  Existing : {list(existing.columns)}")
+                    print(f"  New      : {list(df.columns)}")
+                    df.to_excel(excel_path, index=False, engine='openpyxl')
+                    print(f"Created new file with {len(df)} rows")
             else:
                 df.to_excel(excel_path, index=False, engine='openpyxl')
                 print(f"Created new file with {len(df)} rows")
 
-            nav_date = df['Date'].iloc[0] if 'Date' in df.columns else 'unknown'
-            print(f"NAV date in data: {nav_date}")
+            nav_date = df.get('Date', df.get('date', pd.Series(['unknown']))).iloc[0]
+            print(f"\nNAV date: {nav_date}")
             EOF
 
         - name: Commit and push
