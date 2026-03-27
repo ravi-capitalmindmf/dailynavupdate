@@ -1,18 +1,17 @@
+name: AMFI NAV Daily Update
 
-  name: AMFI NAV Daily Update
-
-  on:
+on:
     schedule:
       - cron: '25 3 * * *'    # 8:55am IST (3:25am UTC)
       - cron: '25 17 * * *'   # 10:55pm IST (5:25pm UTC)
-    workflow_dispatch:          # enables manual trigger from GitHub UI
+    workflow_dispatch:
 
-  jobs:
+jobs:
     update-nav:
       runs-on: ubuntu-latest
 
       permissions:
-        contents: write         # needed to commit and push
+        contents: write
 
       steps:
         - name: Checkout repository
@@ -36,13 +35,51 @@
             url = "https://www.amfiindia.com/api/latest-nav?type=&mfid=81"
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            data = resp.json()
 
-            if not data:
-                print("ERROR: Empty data returned from API")
-                sys.exit(1)
+            # --- Inspect raw response ---
+            print(f"Content-Type : {resp.headers.get('Content-Type', 'unknown')}")
+            print(f"Response preview: {resp.text[:300]}")
 
-            df = pd.DataFrame(data)
+            # --- Parse: handle text, JSON string, nested dict, or list ---
+            raw = resp.text.strip()
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Might be semicolon/pipe delimited text (AMFI text format)
+                from io import StringIO
+                df = pd.read_csv(StringIO(raw), sep=';', skipinitialspace=True)
+                print(f"Parsed as delimited text. Shape: {df.shape}")
+                data = None
+
+            if data is not None:
+                # Unwrap double-encoded string
+                if isinstance(data, str):
+                    data = json.loads(data)
+
+                # Unwrap nested dict — find the list inside
+                if isinstance(data, dict):
+                    print(f"Response is a dict with keys: {list(data.keys())}")
+                    for key in ['data', 'Data', 'result', 'Result', 'nav', 'NAV', 'schemes']:
+                        if key in data and isinstance(data[key], list):
+                            data = data[key]
+                            break
+                    else:
+                        for v in data.values():
+                            if isinstance(v, list) and len(v) > 0:
+                                data = v
+                                break
+
+                if not isinstance(data, list) or len(data) == 0:
+                    print(f"ERROR: Unexpected data structure: {type(data)}")
+                    sys.exit(1)
+
+                df = pd.DataFrame(data)
+
+            print(f"Columns: {list(df.columns)}")
+            print(f"Rows: {len(df)}")
+            print(df.head(2).to_string())
+
             df['Downloaded_At_UTC'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
             excel_path = 'nav_history/nav_mfid81.xlsx'
