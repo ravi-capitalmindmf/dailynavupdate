@@ -1,0 +1,71 @@
+
+  name: AMFI NAV Daily Update
+
+  on:
+    schedule:
+      - cron: '25 3 * * *'    # 8:55am IST (3:25am UTC)
+      - cron: '25 17 * * *'   # 10:55pm IST (5:25pm UTC)
+    workflow_dispatch:          # enables manual trigger from GitHub UI
+
+  jobs:
+    update-nav:
+      runs-on: ubuntu-latest
+
+      permissions:
+        contents: write         # needed to commit and push
+
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
+
+        - name: Install dependencies
+          run: pip install pandas openpyxl requests
+
+        - name: Download and process NAV data
+          run: |
+            python << 'EOF'
+            import json, os, sys, requests
+            from datetime import datetime, timezone
+            import pandas as pd
+
+            url = "https://www.amfiindia.com/api/latest-nav?type=&mfid=81"
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if not data:
+                print("ERROR: Empty data returned from API")
+                sys.exit(1)
+
+            df = pd.DataFrame(data)
+            df['Downloaded_At_UTC'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+            excel_path = 'nav_history/nav_mfid81.xlsx'
+            os.makedirs('nav_history', exist_ok=True)
+
+            if os.path.exists(excel_path):
+                existing = pd.read_excel(excel_path, engine='openpyxl')
+                combined = pd.concat([existing, df], ignore_index=True)
+                combined.to_excel(excel_path, index=False, engine='openpyxl')
+                print(f"Appended {len(df)} rows. Total rows: {len(combined)}")
+            else:
+                df.to_excel(excel_path, index=False, engine='openpyxl')
+                print(f"Created new file with {len(df)} rows")
+
+            nav_date = df['Date'].iloc[0] if 'Date' in df.columns else 'unknown'
+            print(f"NAV date in data: {nav_date}")
+            EOF
+
+        - name: Commit and push
+          run: |
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "GitHub Actions"
+            git add nav_history/nav_mfid81.xlsx
+            git diff --cached --quiet && echo "No changes to commit" || \
+              git commit -m "NAV update $(date -u '+%Y-%m-%d %H:%M UTC') mfid=81"
+            git push
